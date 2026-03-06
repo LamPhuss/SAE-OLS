@@ -1,0 +1,6 @@
+torch>=2.0
+transformers>=4.40
+huggingface_hub
+numpy
+scikit-learn
+matplotlib
