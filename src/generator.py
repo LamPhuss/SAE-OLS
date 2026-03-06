@@ -152,40 +152,62 @@ class WatermarkedGenerator:
             v_target = self.sae.get_feature_vector(target_idx)  # [d_model]
 
             # --- Step 3: Build semantic subspace from top-K tokens ---
-            W_topK, _ = self._get_top_k_unembeddings(original_logits, wm_cfg.top_k)
+            W_top1, _ = self._get_top_k_unembeddings(original_logits, k=1)
 
             # --- Step 4: Orthogonal projection ---
-            delta_h = compute_orthogonal_steering_vector(
-                v_target.float(), W_topK.float(), eps=wm_cfg.projection_eps
-            )
+            probs = torch.softmax(original_logits, dim=-1)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-10))
+            
+            # CHỈ STEER NẾU ENTROPY CAO (Mô hình đang phân vân giữa nhiều từ đồng nghĩa)
+            if entropy.item() < 2.0: 
+                steered_logits = original_logits.float() # Bỏ qua, giữ nguyên gốc
+            else:
+                delta_h = compute_orthogonal_steering_vector(
+                    v_target.float(), W_top1.float(), eps=wm_cfg.projection_eps
+                )
+                
+                delta_h_norm = delta_h.norm()
+                if delta_h_norm > 1e-8:
+                    delta_h = delta_h / delta_h_norm
 
-            # Normalize delta_h to unit norm so alpha has consistent scale
-            delta_h_norm = delta_h.norm()
-            if delta_h_norm > 1e-8:
-                delta_h = delta_h / delta_h_norm
+                # --- Step 5 & 6: Logit Delta Approximation ---
+                # Tính toán lượng thay đổi logit thô
+                logit_delta_raw = (self._W_U @ delta_h.to(self._W_U.dtype)).float()
 
-            # --- Step 5: Steer hidden state ---
-            # Scale alpha relative to h_t's norm for proportional perturbation
-            h_last_f = h_last.float()
-            h_steered = h_last_f + wm_cfg.alpha * delta_h  # [d_model]
+                # ==========================================================
+                # GIẢI QUYẾT LỜI NGUYỀN SỐ CHIỀU CAO (Khuếch đại tín hiệu)
+                # ==========================================================
+                V_c = 10 
+                top_Vc_vals, top_Vc_indices = torch.topk(original_logits, V_c)
+                
+                # Trích xuất các giá trị delta thô trong nhóm Top 10
+                delta_top_c = logit_delta_raw[top_Vc_indices]
+                
+                # Tìm biên độ lớn nhất trong nhóm này
+                max_delta = delta_top_c.abs().max()
+                
+                # Khuếch đại tín hiệu: Ép giá trị lớn nhất vọt lên mức 5.0
+                # (Đủ mạnh để vượt qua khoảng cách logit giữa Top 2 và Top 1)
+                if max_delta > 1e-8:
+                    logit_delta = (logit_delta_raw / max_delta) * 2.0
+                else:
+                    logit_delta = logit_delta_raw
+                    
+                # Cộng lượng boost (đã khuếch đại và nhân alpha) vào Logit gốc
+                steered_logits = original_logits.float() + (wm_cfg.alpha * logit_delta)
 
-            # --- Step 6: Recompute logits with steered hidden state ---
-            # z'_t = W_U @ h'_t
-            steered_logits = self._W_U.float() @ h_steered  # [V]
+                # ==========================================================
+                # LÁ CHẮN KÉP (Double-Shield)
+                # ==========================================================
+                mask = torch.ones_like(original_logits, dtype=torch.bool, device=self.device)
+                mask[top_Vc_indices] = False
+                
+                # 1. Khóa toàn bộ từ vựng ngoài Top 10 về điểm gốc
+                steered_logits[mask] = original_logits[mask].float()
 
-            # Clamp: non-top-K tokens must not exceed the K-th original logit.
-            # This prevents tail tokens from overtaking semantic tokens.
-            topk_vals = torch.topk(original_logits, wm_cfg.top_k).values
-            kth_logit = topk_vals[-1]  # smallest logit among top-K
-            # Restore original top-K logits exactly (enforce distortion-free)
-            top_indices = torch.topk(original_logits, wm_cfg.top_k).indices
-            steered_logits[top_indices] = original_logits[top_indices].float()
-            # Clamp remaining logits so they cannot surpass the K-th token
-            non_top_mask = torch.ones(steered_logits.shape[0], dtype=torch.bool, device=self.device)
-            non_top_mask[top_indices] = False
-            steered_logits[non_top_mask] = torch.clamp(
-                steered_logits[non_top_mask], max=kth_logit.float()
-            )
+                # 2. Trần điểm số (Anti-Spike): Giới hạn không cho token vọt quá xa Top 1
+                max_allowed_logit = top_Vc_vals[0].float() + 0.1
+                steered_logits = torch.clamp(steered_logits, max=max_allowed_logit)
 
             # --- Step 7: Sample from steered distribution ---
             if self.config.model.do_sample:

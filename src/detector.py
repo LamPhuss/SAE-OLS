@@ -24,6 +24,7 @@ from config import Config
 from sae import JumpReLUSAE, load_sae
 from prf import get_context_window, select_target_feature_index
 from hooks import gather_residual_activations
+from orthogonal import compute_orthogonal_steering_vector
 
 
 @dataclass
@@ -105,53 +106,91 @@ class WatermarkDetector:
                 total_score=0.0, num_tokens=N, mean_score=0.0
             )
 
-        # --- Step 1: Get hidden states at target layer ---
-        hidden_states = gather_residual_activations(
-            self.model, sae_cfg.target_layer, input_ids,
-            attention_mask=inputs.get("attention_mask")
-        )  # [1, N, d_model]
-        hidden_states = hidden_states[0]  # [N, d_model]
+        # --- Step 1: Pass text through model to get logits ---
+        if hasattr(self.model, 'lm_head'):
+            W_U = self.model.lm_head.weight.detach()
+        elif hasattr(self.model, 'embed_out'):
+            W_U = self.model.embed_out.weight.detach()
+        else:
+            raise ValueError("Không tìm thấy ma trận unembedding")
 
-        # --- Step 2: Reconstruct target features and compute scores ---
-        # Use cosine similarity instead of raw dot product.
-        # Raw dot product is dominated by h_t's large norm, making all scores
-        # positive regardless of watermark presence. Cosine similarity normalizes
-        # both vectors, isolating the directional alignment signal.
+        # Chạy forward pass 1 lần duy nhất để lấy toàn bộ logits tự nhiên
+        with torch.no_grad():
+            outputs = self.model(input_ids)
+            logits = outputs.logits[0]  # [N, V]
+
+        # --- Step 2: Reconstruct delta_h and compute scores ---
+        from orthogonal import compute_orthogonal_steering_vector
+        
         scores = []
-        for t in range(N):
-            ctx = get_context_window(token_ids, t, wm_cfg.context_window)
-
+        valid_tokens_count = 0  # Biến đếm số token thực sự được đo
+        
+        for t in range(N - 1):
+            # 1. Tìm lại original_logits tại bước t y hệt như Generator
+            original_logits_t = logits[t]
+            
+            # ==========================================================
+            # GÁC CỔNG ENTROPY Ở DETECTOR (Phải khớp với Generator)
+            # ==========================================================
+            probs = torch.softmax(original_logits_t, dim=-1)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-10))
+            
+            # Thay '1.0' bằng đúng ngưỡng Entropy bạn đã cài ở Generator
+            if entropy.item() < 2.0: 
+                continue  # Bỏ qua hoàn toàn token này, không tính vào Z-Score
+                
+            valid_tokens_count += 1
+            
+            # --- Các bước tiếp theo giữ nguyên ---
+            ctx = get_context_window(token_ids, t + 1, wm_cfg.context_window)
             target_idx = select_target_feature_index(
                 secret_key, ctx, self.sae.d_sae, wm_cfg.hash_algorithm
             )
+            v_target = self.sae.get_feature_vector(target_idx).float()
+            
+            top1_idx = torch.topk(original_logits_t, 1).indices
+            W_top1 = W_U[top1_idx].float()
 
-            v_target = self.sae.get_feature_vector(target_idx).float()  # [d_model]
-            h_t = hidden_states[t].float()
+            delta_h = compute_orthogonal_steering_vector(
+                v_target, W_top1, eps=wm_cfg.projection_eps
+            )
+            delta_h_norm = delta_h.norm()
+            if delta_h_norm > 1e-8:
+                delta_h = delta_h / delta_h_norm
 
-            # Cosine similarity: s_t = (h_t · v_target) / (||h_t|| * ||v_target||)
-            h_norm = h_t.norm()
-            v_norm = v_target.norm()
-            if h_norm > 1e-8 and v_norm > 1e-8:
-                s_t = (torch.dot(h_t, v_target) / (h_norm * v_norm)).item()
+            next_token = token_ids[t + 1]
+            token_vec = W_U[next_token].float()
+
+            tok_norm = token_vec.norm()
+            d_norm = delta_h.norm()
+            if tok_norm > 1e-8 and d_norm > 1e-8:
+                s_t = (torch.dot(token_vec, delta_h) / (tok_norm * d_norm)).item()
             else:
                 s_t = 0.0
+            
             scores.append(s_t)
-
+            
         # --- Step 3: Z-score hypothesis testing ---
-        # With cosine similarity, scores are bounded in [-1, 1].
-        # Under H0 (no watermark), v_target is pseudo-random relative to h_t,
-        # so E[s_t] ≈ 0 and std is small (empirically ~0.02-0.05 for high-dim vectors).
+        # SỬA LỖI Ở ĐÂY: Dùng số lượng token hợp lệ (valid_tokens_count) thay vì N
+        if valid_tokens_count < 2:
+            return DetectionResult(
+                is_watermarked=False, 
+                z_score=0.0, 
+                p_value=1.0,
+                total_score=0.0, 
+                num_tokens=N, 
+                mean_score=0.0
+            )
+
         scores_tensor = torch.tensor(scores)
         mean_score = scores_tensor.mean().item()
-
-        # Self-standardized Z-score: use sample mean and std directly.
-        # This avoids needing pre-calibrated mu_0/sigma_0.
         sample_std = scores_tensor.std().item()
-        if sample_std > 1e-8 and N > 2:
-            z_score = mean_score / (sample_std / math.sqrt(N))
+        
+        if sample_std > 1e-8:
+            # Chia cho căn bậc hai của số token THỰC SỰ mang watermark
+            z_score = mean_score / (sample_std / math.sqrt(valid_tokens_count))
         else:
             z_score = 0.0
-
         S_N = scores_tensor.sum().item()
 
         # One-sided p-value: P(Z > z) under standard normal

@@ -26,11 +26,11 @@ class SAEConfig:
 class WatermarkConfig:
     """Configuration for watermark embedding and detection."""
     # --- Key & PRF ---
-    context_window: int = 4        # w: number of preceding tokens for context hash
+    context_window: int = 2        # w: number of preceding tokens for context hash
     hash_algorithm: str = "sha256" # cryptographic hash for PRF
 
     # --- Orthogonal Projection ---
-    top_k: int = 50                # K: number of top logit tokens defining semantic subspace S
+    top_k: int = 1                # K: number of top logit tokens defining semantic subspace S
     alpha: float = 1.0             # steering intensity coefficient (normalized delta_h)
     # Regularization epsilon for numerical stability in (W W^T)^{-1}
     projection_eps: float = 1e-6
@@ -40,7 +40,7 @@ class WatermarkConfig:
     # Null distribution parameters (estimated from human-written text)
     # These should be calibrated empirically; defaults are placeholders
     mu_0: float = 0.0              # expected mean of dot-product scores under H0
-    sigma_0: float = 1.0           # expected std of dot-product scores under H0
+    sigma_0: float = 0.5           # expected std of dot-product scores under H0
 
 
 @dataclass
@@ -50,7 +50,7 @@ class ModelConfig:
     device: str = "cuda:0"
     torch_dtype: str = "bfloat16"  # "float16", "bfloat16", or "float32"
     # Generation parameters
-    max_new_tokens: int = 200
+    max_new_tokens: int = 400
     temperature: float = 0.7
     top_p: float = 0.9
     do_sample: bool = True
