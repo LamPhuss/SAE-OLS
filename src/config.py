@@ -31,7 +31,7 @@ class WatermarkConfig:
 
     # --- Orthogonal Projection ---
     top_k: int = 50                # K: number of top logit tokens defining semantic subspace S
-    alpha: float = 5.0             # steering intensity coefficient
+    alpha: float = 1.0             # steering intensity coefficient (normalized delta_h)
     # Regularization epsilon for numerical stability in (W W^T)^{-1}
     projection_eps: float = 1e-6
 

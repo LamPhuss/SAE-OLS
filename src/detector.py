@@ -113,32 +113,46 @@ class WatermarkDetector:
         hidden_states = hidden_states[0]  # [N, d_model]
 
         # --- Step 2: Reconstruct target features and compute scores ---
+        # Use cosine similarity instead of raw dot product.
+        # Raw dot product is dominated by h_t's large norm, making all scores
+        # positive regardless of watermark presence. Cosine similarity normalizes
+        # both vectors, isolating the directional alignment signal.
         scores = []
         for t in range(N):
-            # Get context window for position t
             ctx = get_context_window(token_ids, t, wm_cfg.context_window)
 
-            # Reconstruct target feature index
             target_idx = select_target_feature_index(
                 secret_key, ctx, self.sae.d_sae, wm_cfg.hash_algorithm
             )
 
-            # Get the target feature vector
-            v_target = self.sae.get_feature_vector(target_idx)  # [d_model]
-
-            # Compute dot-product score: s_t = h_t^T @ v_target
+            v_target = self.sae.get_feature_vector(target_idx).float()  # [d_model]
             h_t = hidden_states[t].float()
-            v_target = v_target.float()
-            s_t = torch.dot(h_t, v_target).item()
+
+            # Cosine similarity: s_t = (h_t · v_target) / (||h_t|| * ||v_target||)
+            h_norm = h_t.norm()
+            v_norm = v_target.norm()
+            if h_norm > 1e-8 and v_norm > 1e-8:
+                s_t = (torch.dot(h_t, v_target) / (h_norm * v_norm)).item()
+            else:
+                s_t = 0.0
             scores.append(s_t)
 
         # --- Step 3: Z-score hypothesis testing ---
+        # With cosine similarity, scores are bounded in [-1, 1].
+        # Under H0 (no watermark), v_target is pseudo-random relative to h_t,
+        # so E[s_t] ≈ 0 and std is small (empirically ~0.02-0.05 for high-dim vectors).
         scores_tensor = torch.tensor(scores)
-        S_N = scores_tensor.sum().item()
         mean_score = scores_tensor.mean().item()
 
-        # Z = (S_N - mu_0) / (sigma_0 * sqrt(N))
-        z_score = (S_N - wm_cfg.mu_0 * N) / (wm_cfg.sigma_0 * math.sqrt(N))
+        # Self-standardized Z-score: use sample mean and std directly.
+        # This avoids needing pre-calibrated mu_0/sigma_0.
+        sample_std = scores_tensor.std().item()
+        if sample_std > 1e-8 and N > 2:
+            z_score = mean_score / (sample_std / math.sqrt(N))
+        else:
+            z_score = 0.0
+
+        S_N = scores_tensor.sum().item()
 
         # One-sided p-value: P(Z > z) under standard normal
         p_value = 0.5 * math.erfc(z_score / math.sqrt(2))

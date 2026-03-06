@@ -43,8 +43,14 @@ class HiddenStateInterceptor:
         Hook function registered on the target layer.
         Captures the hidden state and optionally applies a modifier.
         """
-        # outputs is typically a tuple (hidden_states, ...) for transformer layers
-        hidden_states = outputs[0]
+        # outputs can be a tuple (hidden_states, ...) or a BaseModelOutputWithPast
+        if isinstance(outputs, tuple):
+            hidden_states = outputs[0]
+        else:
+            hidden_states = outputs
+        # Ensure 3D: [batch, seq_len, d_model]
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(0)
         self._captured_hidden_state = hidden_states.detach().clone()
 
         if self._modifier is not None:
@@ -129,7 +135,13 @@ def gather_residual_activations(
 
     def hook_fn(module, inputs, outputs):
         nonlocal captured
-        captured = outputs[0].detach()
+        if isinstance(outputs, tuple):
+            hidden_states = outputs[0]
+        else:
+            hidden_states = outputs
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(0)
+        captured = hidden_states.detach()
         return outputs
 
     # Get the layer

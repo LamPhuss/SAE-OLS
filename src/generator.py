@@ -156,16 +156,36 @@ class WatermarkedGenerator:
 
             # --- Step 4: Orthogonal projection ---
             delta_h = compute_orthogonal_steering_vector(
-                v_target, W_topK, eps=wm_cfg.projection_eps
+                v_target.float(), W_topK.float(), eps=wm_cfg.projection_eps
             )
 
+            # Normalize delta_h to unit norm so alpha has consistent scale
+            delta_h_norm = delta_h.norm()
+            if delta_h_norm > 1e-8:
+                delta_h = delta_h / delta_h_norm
+
             # --- Step 5: Steer hidden state ---
-            # h'_t = h_t + alpha * delta_h
-            h_steered = h_last + wm_cfg.alpha * delta_h  # [d_model]
+            # Scale alpha relative to h_t's norm for proportional perturbation
+            h_last_f = h_last.float()
+            h_steered = h_last_f + wm_cfg.alpha * delta_h  # [d_model]
 
             # --- Step 6: Recompute logits with steered hidden state ---
             # z'_t = W_U @ h'_t
-            steered_logits = self._W_U @ h_steered  # [V]
+            steered_logits = self._W_U.float() @ h_steered  # [V]
+
+            # Clamp: non-top-K tokens must not exceed the K-th original logit.
+            # This prevents tail tokens from overtaking semantic tokens.
+            topk_vals = torch.topk(original_logits, wm_cfg.top_k).values
+            kth_logit = topk_vals[-1]  # smallest logit among top-K
+            # Restore original top-K logits exactly (enforce distortion-free)
+            top_indices = torch.topk(original_logits, wm_cfg.top_k).indices
+            steered_logits[top_indices] = original_logits[top_indices].float()
+            # Clamp remaining logits so they cannot surpass the K-th token
+            non_top_mask = torch.ones(steered_logits.shape[0], dtype=torch.bool, device=self.device)
+            non_top_mask[top_indices] = False
+            steered_logits[non_top_mask] = torch.clamp(
+                steered_logits[non_top_mask], max=kth_logit.float()
+            )
 
             # --- Step 7: Sample from steered distribution ---
             if self.config.model.do_sample:
