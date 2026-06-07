@@ -7,17 +7,19 @@ Sparse Autoencoder - Orthogonal Latent Steering Watermark system.
 
 from dataclasses import dataclass, field
 from typing import Optional
-import os
-os.environ["HF_HOME"] = "/media/ics-security/Data/PhuPham/huggingface_cache"
+
 
 @dataclass
 class SAEConfig:
-    """Configuration for the Sparse Autoencoder component (Using SAE-Lens)."""
-    release: str = "llama-3-8b-it-res-jh"
-    sae_id: str = "blocks.25.hook_resid_post"  # Layer 25 của Llama-3
-    d_model: Optional[int] = 4096              # Llama-3 8B dùng 4096 chiều
-    d_sae: Optional[int] = None                # Tự động lấy từ SAE-Lens
-    target_layer: int = 25                     # Giữ lại biến này phòng hờ code cũ gọi đến
+    """Configuration for the Sparse Autoencoder component."""
+    # HuggingFace repo for pretrained SAE weights (Gemma Scope)
+    repo_id: str = "google/gemma-scope-2b-pt-res"
+    filename: str = "layer_20/width_16k/average_l0_71/params.npz"
+    # SAE architecture dimensions (inferred from weights at load time)
+    d_model: Optional[int] = None  # hidden size of the LLM (e.g. 2304 for Gemma-2-2B)
+    d_sae: Optional[int] = None    # number of SAE features (e.g. 16384)
+    # Which residual stream layer to hook into
+    target_layer: int = 20
 
 
 @dataclass
@@ -29,7 +31,7 @@ class WatermarkConfig:
 
     # --- Orthogonal Projection ---
     top_k: int = 1                # K: number of top logit tokens defining semantic subspace S
-    alpha: float = 2.5           # steering intensity coefficient (normalized delta_h)
+    alpha: float = 1.0             # steering intensity coefficient (normalized delta_h)
     # Regularization epsilon for numerical stability in (W W^T)^{-1}
     projection_eps: float = 1e-6
 
@@ -44,12 +46,11 @@ class WatermarkConfig:
 @dataclass
 class ModelConfig:
     """Configuration for the LLM and tokenizer."""
-    # Quan trọng: Vì SAE ghi chữ "it" (Instruct), bạn NÊN dùng bản Instruct để vector khớp hoàn hảo
-    model_name_or_path: str = "meta-llama/Meta-Llama-3-8B-Instruct" 
+    model_name_or_path: str = "google/gemma-2-2b"
     device: str = "cuda:0"
-    torch_dtype: str = "bfloat16"
+    torch_dtype: str = "bfloat16"  # "float16", "bfloat16", or "float32"
     # Generation parameters
-    max_new_tokens: int = 400
+    max_new_tokens: int = 200
     temperature: float = 0.7
     top_p: float = 0.9
     do_sample: bool = True

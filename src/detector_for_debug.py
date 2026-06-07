@@ -21,7 +21,7 @@ class DetectionResult:
     mean_score: float
     per_token_scores: Optional[List[float]] = None
     used_clusters: Optional[List[int]] = None
-    token_details: Optional[List[dict]] = None 
+    token_details: Optional[List[dict]] = None # <--- Đã có
 
 class WatermarkDetector:
     def __init__(self, config: Config):
@@ -35,33 +35,27 @@ class WatermarkDetector:
             quantization_config=bnb_config,
         )
         self.model.eval()
-        
-        # [VÁ LỖI OOM 1]: Trả 5.1GB VRAM dư thừa lại cho GPU
-        torch.cuda.empty_cache() 
-        
-        # [VÁ LỖI OOM 2]: Tải SAE lên CPU
-        self.sae = load_sae(config.sae, device="cpu")
-        
+        self.sae = load_sae(config.sae, device=self.device)
         if self.tokenizer.pad_token is None: self.tokenizer.pad_token = self.tokenizer.eos_token
         self.d_model = self.model.config.hidden_size
         
         self.anchor = SemanticAdapter(n_clusters=4096).to(self.device)
         adapter_path = os.path.join(os.path.dirname(__file__), "..", "models", "semantic_adapter.pth")
+        
         if os.path.exists(adapter_path):
             self.anchor.load_state_dict(torch.load(adapter_path, map_location=self.device))
+        else:
+            print(f"CẢNH BÁO NGUY HIỂM: Không tìm thấy {adapter_path}. Adapter đang chạy bằng Random Weights!")
             
         self.anchor.init_inference_tools(self.device)
         self.anchor.eval()
         
     @torch.no_grad()
-    def detect(self, prompt_text: str, generated_text: str, secret_key: str, return_per_token: bool = False, return_token_details: bool = False) -> DetectionResult:
+    # THÊM THAM SỐ return_token_details Ở ĐÂY:
+    def detect(self, text: str, secret_key: str, prompt_len: int = 0, return_per_token: bool = False, return_token_details: bool = False) -> DetectionResult:
         wm_cfg = self.config.watermark
-        
-        prompt_tokens = self.tokenizer.encode(prompt_text, add_special_tokens=True)
-        gen_tokens = self.tokenizer.encode(generated_text, add_special_tokens=False)
-        
-        token_ids = prompt_tokens + gen_tokens
-        prompt_len = len(prompt_tokens)
+        inputs = self.tokenizer(text, return_tensors="pt", add_special_tokens=True).to(self.device)
+        token_ids = inputs["input_ids"][0].tolist()
         N = len(token_ids)
 
         if N <= prompt_len + 1: 
@@ -77,46 +71,41 @@ class WatermarkDetector:
         
         W_U = self.W_U_cache
 
-        prompt_ids = prompt_tokens
+        prompt_ids = token_ids[:prompt_len]
         seed = get_static_prompt_seed(prompt_ids, secret_key)
-        
-        # Chỉ kéo duy nhất 1 vector target lên GPU
-        rng = torch.Generator(device='cpu')
+        rng = torch.Generator(device=self.device)
         rng.manual_seed(seed)
-        target_idx = torch.randint(0, self.sae.d_sae, (1,), generator=rng).item()
-        v_target = self.sae.get_feature_vector(target_idx).float().to(self.device)
+        target_idx = torch.randint(0, self.sae.d_sae, (1,), generator=rng, device=self.device).item()
+        v_target = self.sae.get_feature_vector(target_idx).float()
 
         with torch.no_grad():
-            input_tensor = torch.tensor([token_ids], device=self.device)
-            outputs = self.model(input_tensor)
+            outputs = self.model(inputs.input_ids)
             logits = outputs.logits[0]
 
         scores, z_scores_t = [], []
         used_clusters = []
-        token_details_list = [] 
+        token_details_list = [] # LOG LIST
         valid_tokens_count = 0
         sum_score = sum_mu = sum_var = 0.0
 
-        start_idx = prompt_len
+        start_idx = max(prompt_len, wm_cfg.context_window)
 
-        for t in range(start_idx, N):
+        for t in range(start_idx, N - 1):
             original_logits_t = logits[t-1]  
-            raw_probs = torch.softmax(original_logits_t, dim=-1)
-            entropy = -torch.sum(raw_probs * torch.log(raw_probs + 1e-10))
-            probs = torch.softmax(original_logits_t / self.config.model.temperature, dim=-1)
             
+            probs = torch.softmax(original_logits_t / self.config.model.temperature, dim=-1)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-10))
             next_token_id = token_ids[t]
+            
+            # --- ĐOẠN LOG MỚI ĐẦY ĐỦ ---
             token_str = self.tokenizer.decode([next_token_id]).replace('\n', '\\n')
             entropy_val = entropy.item()
-            prob_val = probs[next_token_id].item()
 
-            if entropy_val < 0.7: 
+            if entropy_val < 1.0: 
                 if return_token_details:
-                    token_details_list.append({
-                        "token": token_str, "entropy": entropy_val, "prob": prob_val, 
-                        "valid": False, "wm_score": 0.0, "reason": "Low Entropy"
-                    })
+                    token_details_list.append({"token": token_str, "entropy": entropy_val, "valid": False, "wm_score": 0.0})
                 continue
+            # --------------------
 
             valid_tokens_count += 1
             W_gen = W_U[next_token_id].float()
@@ -159,11 +148,10 @@ class WatermarkDetector:
 
             used_clusters.append(unique_c_ids[best_idx])
             
+            # --- THÊM LOG CHO TỪ HỢP LỆ ---
             if return_token_details:
-                token_details_list.append({
-                    "token": token_str, "entropy": entropy_val, "prob": prob_val, 
-                    "valid": True, "wm_score": best_score - best_mu, "reason": ""
-                })
+                token_details_list.append({"token": token_str, "entropy": entropy_val, "valid": True, "wm_score": best_score - best_mu})
+            # ------------------------------
 
             sum_score += best_score
             sum_mu += best_mu
@@ -187,5 +175,5 @@ class WatermarkDetector:
             mean_score=sum_score/valid_tokens_count if valid_tokens_count else 0,
             per_token_scores=z_scores_t if return_per_token else None,
             used_clusters=used_clusters,
-            token_details=token_details_list if return_token_details else None 
+            token_details=token_details_list if return_token_details else None # TRẢ VỀ Ở ĐÂY
         )

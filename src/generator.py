@@ -1,257 +1,182 @@
-"""
-Watermarked Text Generator for SAE-OLS.
-
-Implements the white-box Orthogonal Latent Steering generation pipeline.
-
-At each token generation step t:
-  1. PRF selects a target SAE feature v_target based on (key, context)
-  2. LLM computes hidden state h_t and logits z_t
-  3. Top-K tokens define the semantic subspace S
-  4. v_target is projected onto S^perp -> delta_h
-  5. Hidden state is steered: h'_t = h_t + alpha * delta_h
-  6. New logits z'_t preserve top-K rankings exactly (distortion-free)
-  7. Token is sampled from softmax(z'_t)
-"""
-
 import torch
 import torch.nn.functional as F
 from typing import List, Optional, Tuple
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
 from config import Config
-from sae import JumpReLUSAE, load_sae
-from prf import get_context_window, select_target_feature_index
-from orthogonal import compute_orthogonal_steering_vector
-from hooks import HiddenStateInterceptor
-
+from prf import get_static_prompt_seed
+from sae import load_sae
+import sys
+import os
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from train_adapter import SemanticAdapter
 
 class WatermarkedGenerator:
-    """
-    Generates watermarked text using Orthogonal Latent Steering.
-
-    The watermark is embedded by subtly steering the LLM's hidden states
-    towards SAE feature directions that are orthogonal to the semantic
-    subspace, ensuring zero distortion on top-K token probabilities.
-    """
-
     def __init__(self, config: Config):
         self.config = config
         self.device = config.model.device
-
-        # Load LLM
         self.tokenizer = AutoTokenizer.from_pretrained(config.model.model_name_or_path)
+        
+        # Nếu muốn giảm thêm 1 nửa VRAM nữa, đổi load_in_8bit thành load_in_4bit=True
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True) 
         self.model = AutoModelForCausalLM.from_pretrained(
             config.model.model_name_or_path,
             device_map=self.device,
-            dtype=getattr(torch, config.model.torch_dtype),
+            quantization_config=bnb_config,
         )
         self.model.eval()
+        
+        # [VÁ LỖI OOM 1]: Ép PyTorch nhả 5.1GB VRAM rác sinh ra trong quá trình tải HuggingFace
+        torch.cuda.empty_cache() 
 
-        # Get the unembedding matrix W_U: [V, d]
-        # For most models this is the lm_head weight or the tied embedding weight
         self._W_U = self._get_unembedding_matrix()
-
-        # Load SAE
-        self.sae = load_sae(config.sae, device=self.device)
-
-        # Set padding token if needed
+        
+        # [VÁ LỖI OOM 2]: Tải nguyên khối SAE 2.5GB lên RAM máy tính (CPU)
+        self.sae = load_sae(config.sae, device="cpu") 
+        
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.d_model = self.model.config.hidden_size
+        self.anchor = SemanticAdapter(n_clusters=4096).to(self.device)
+        self.anchor.load_state_dict(torch.load("models/semantic_adapter.pth", map_location=self.device))
+        self.anchor.init_inference_tools(self.device) 
+        self.anchor.eval()
+        print("Đã kích hoạt Chế độ Hình Học Thanh Lịch (Geometric Mode) - Tối ưu VRAM!")
 
     def _get_unembedding_matrix(self) -> torch.Tensor:
-        """
-        Extract the unembedding (output projection) matrix W_U from the model.
-        W_U maps hidden states to logits: z = W_U @ h
-
-        Returns:
-            W_U of shape [vocab_size, d_model]
-        """
-        if hasattr(self.model, 'lm_head'):
-            return self.model.lm_head.weight.detach()  # [V, d]
-        elif hasattr(self.model, 'embed_out'):
-            return self.model.embed_out.weight.detach()
-        else:
-            raise ValueError("Cannot find unembedding matrix in model architecture")
-
-    def _get_top_k_unembeddings(self, logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Get the unembedding vectors for the top-K tokens by logit value.
-
-        Args:
-            logits: Logit scores for all tokens, shape [V]
-            k: Number of top tokens
-
-        Returns:
-            W_topK: Unembedding vectors, shape [K, d]
-            top_indices: Token indices, shape [K]
-        """
-        top_indices = torch.topk(logits, k).indices  # [K]
-        W_topK = self._W_U[top_indices]  # [K, d]
-        return W_topK, top_indices
+        if hasattr(self.model, 'lm_head'): return self.model.lm_head.weight.detach()
+        elif hasattr(self.model, 'embed_out'): return self.model.embed_out.weight.detach()
+        else: raise ValueError("Cannot find unembedding matrix")
 
     @torch.no_grad()
-    def generate(
-        self,
-        prompt: str,
-        secret_key: str,
-        max_new_tokens: Optional[int] = None,
-    ) -> str:
-        """
-        Generate watermarked text from a prompt.
-
-        This implements the full SAE-OLS pipeline:
-        For each new token, we intercept the hidden state, compute the
-        orthogonal steering vector, and modify the hidden state before
-        the model computes final logits.
-
-        Args:
-            prompt: Input text prompt
-            secret_key: Watermark secret key K
-            max_new_tokens: Max tokens to generate (overrides config)
-
-        Returns:
-            Generated watermarked text (prompt + continuation)
-        """
+    def generate(self, prompt: str, secret_key: str, max_new_tokens: Optional[int] = None, return_token_details: bool = False):
         max_tokens = max_new_tokens or self.config.model.max_new_tokens
         wm_cfg = self.config.watermark
         sae_cfg = self.config.sae
-
-        # Tokenize prompt
+        steered_count = 0
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        input_ids = inputs["input_ids"]  # [1, prompt_len]
-        generated_ids = input_ids[0].tolist()  # flat list for tracking
+        prompt_ids = inputs["input_ids"][0].tolist()
+        generated_ids = prompt_ids.copy()
+        
+        self.last_used_clusters = []
+        token_details_list = [] 
 
-        # Token-by-token generation with steering
+        seed = get_static_prompt_seed(prompt_ids, secret_key)
+        
+        # Generator phải ở trên CPU vì SAE đang ở CPU
+        rng = torch.Generator(device='cpu')
+        rng.manual_seed(seed)
+        target_idx = torch.randint(0, self.sae.d_sae, (1,), generator=rng).item()
+        
+        # Chỉ kéo duy nhất 1 vector v_target lên GPU. Tiết kiệm 2.5GB!
+        v_target = self.sae.get_feature_vector(target_idx).float().to(self.device)
+
+        past_key_values = None
+        cur_ids = inputs.input_ids
+
         for step in range(max_tokens):
-            # Current full sequence as tensor
-            cur_ids = torch.tensor([generated_ids], device=self.device)
+            outputs = self.model(cur_ids, past_key_values=past_key_values, use_cache=True)
+            past_key_values = outputs.past_key_values
+            original_logits = outputs.logits[0, -1, :]
 
-            # --- Step 1: Forward pass to get hidden state and logits ---
-            # We need both the hidden state at target_layer AND the final logits.
-            # Use a hook to capture hidden state at the SAE's target layer.
-            interceptor = HiddenStateInterceptor(self.model, sae_cfg.target_layer)
-
-            # We'll do a two-phase approach:
-            # Phase A: Forward pass to get original logits and hidden state
-            interceptor.register()
-            outputs = self.model(cur_ids)
-            h_t = interceptor.captured  # [1, seq_len, d_model]
-            interceptor.remove()
-
-            # Get logits for the LAST token position
-            original_logits = outputs.logits[0, -1, :]  # [V]
-            h_last = h_t[0, -1, :]  # [d_model] — hidden state of last token
-
-            # --- Step 2: PRF selects target feature ---
-            ctx = get_context_window(
-                generated_ids, len(generated_ids), wm_cfg.context_window
-            )
-            target_idx = select_target_feature_index(
-                secret_key, ctx, self.sae.d_sae, wm_cfg.hash_algorithm
-            )
-            v_target = self.sae.get_feature_vector(target_idx)  # [d_model]
-
-            # --- Step 3: Build semantic subspace from top-K tokens ---
-            W_top1, _ = self._get_top_k_unembeddings(original_logits, k=1)
-
-            # --- Step 4: Orthogonal projection ---
             probs = torch.softmax(original_logits, dim=-1)
             entropy = -torch.sum(probs * torch.log(probs + 1e-10))
+            is_steered_step = False
+            logit_delta = None
             
-            # CHỈ STEER NẾU ENTROPY CAO (Mô hình đang phân vân giữa nhiều từ đồng nghĩa)
-            if entropy.item() < 2.0: 
-                steered_logits = original_logits.float() # Bỏ qua, giữ nguyên gốc
+            if entropy.item() < 0.7:
+                steered_logits = original_logits.float()
             else:
-                delta_h = compute_orthogonal_steering_vector(
-                    v_target.float(), W_top1.float(), eps=wm_cfg.projection_eps
-                )
+                is_steered_step = True
+                window_size = 50
+                ctx_ids = generated_ids[-window_size:] if len(generated_ids) > window_size else generated_ids
+                ctx_text = self.tokenizer.decode(ctx_ids, skip_special_tokens=True)
                 
-                delta_h_norm = delta_h.norm()
-                if delta_h_norm > 1e-8:
-                    delta_h = delta_h / delta_h_norm
+                c_id, S_stable = self.anchor.get_geometric_anchor(ctx_text)
+                self.last_used_clusters.append(c_id.item())
 
-                # --- Step 5 & 6: Logit Delta Approximation ---
-                # Tính toán lượng thay đổi logit thô
+                S_norm = S_stable / (S_stable.norm() + 1e-8)
+                delta_h = v_target - torch.dot(v_target.squeeze(), S_norm.squeeze()) * S_norm
+                delta_h = delta_h / (delta_h.norm() + 1e-8)
+
                 logit_delta_raw = (self._W_U @ delta_h.to(self._W_U.dtype)).float()
+                
+                mean_delta = logit_delta_raw.mean()
+                std_delta = logit_delta_raw.std()
+                logit_delta = (logit_delta_raw - mean_delta) / (std_delta + 1e-8)
+                logit_delta = torch.clamp(logit_delta, min=-1.0, max=2.0)
 
-                # ==========================================================
-                # GIẢI QUYẾT LỜI NGUYỀN SỐ CHIỀU CAO (Khuếch đại tín hiệu)
-                # ==========================================================
-                V_c = 10 
-                top_Vc_vals, top_Vc_indices = torch.topk(original_logits, V_c)
-                
-                # Trích xuất các giá trị delta thô trong nhóm Top 10
-                delta_top_c = logit_delta_raw[top_Vc_indices]
-                
-                # Tìm biên độ lớn nhất trong nhóm này
-                max_delta = delta_top_c.abs().max()
-                
-                # Khuếch đại tín hiệu: Ép giá trị lớn nhất vọt lên mức 5.0
-                # (Đủ mạnh để vượt qua khoảng cách logit giữa Top 2 và Top 1)
-                if max_delta > 1e-8:
-                    logit_delta = (logit_delta_raw / max_delta) * 2.0
-                else:
-                    logit_delta = logit_delta_raw
-                    
-                # Cộng lượng boost (đã khuếch đại và nhân alpha) vào Logit gốc
+                top_k = 10000
+                _, top_indices = torch.topk(original_logits, top_k)
+                mask = torch.ones_like(original_logits, dtype=torch.bool)
+                mask[top_indices] = False
+                logit_delta[mask] = 0.0 
+
                 steered_logits = original_logits.float() + (wm_cfg.alpha * logit_delta)
 
-                # ==========================================================
-                # LÁ CHẮN KÉP (Double-Shield)
-                # ==========================================================
-                mask = torch.ones_like(original_logits, dtype=torch.bool, device=self.device)
-                mask[top_Vc_indices] = False
-                
-                # 1. Khóa toàn bộ từ vựng ngoài Top 10 về điểm gốc
-                steered_logits[mask] = original_logits[mask].float()
+                window_size_wrp = 40
+                recent_ids = list(set(generated_ids[-window_size_wrp:]))
+                for tk in recent_ids:
+                    if logit_delta[tk].item() > 0.5:
+                        steered_logits[tk] -= (wm_cfg.alpha * logit_delta[tk].item())
 
-                # 2. Trần điểm số (Anti-Spike): Giới hạn không cho token vọt quá xa Top 1
-                max_allowed_logit = top_Vc_vals[0].float() + 0.1
-                steered_logits = torch.clamp(steered_logits, max=max_allowed_logit)
-
-            # --- Step 7: Sample from steered distribution ---
             if self.config.model.do_sample:
-                # Apply temperature
                 steered_logits = steered_logits / self.config.model.temperature
-                # Apply top-p (nucleus) sampling
-                probs = F.softmax(steered_logits, dim=-1)
-                sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-                cumsum = torch.cumsum(sorted_probs, dim=-1)
-                # Remove tokens with cumulative probability above top_p
-                mask = cumsum - sorted_probs > self.config.model.top_p
-                sorted_probs[mask] = 0.0
+                probs_sampled = F.softmax(steered_logits, dim=-1)
+                sorted_probs, sorted_indices = torch.sort(probs_sampled, descending=True)
+
+                mask_p = torch.cumsum(sorted_probs, dim=-1) - sorted_probs > self.config.model.top_p
+                sorted_probs[mask_p] = 0.0
                 sorted_probs = sorted_probs / sorted_probs.sum()
-                # Sample
-                idx_in_sorted = torch.multinomial(sorted_probs, 1)
-                next_token = sorted_indices[idx_in_sorted].item()
+
+                next_token = sorted_indices[torch.multinomial(sorted_probs, 1)].item()
             else:
                 next_token = steered_logits.argmax().item()
 
             generated_ids.append(next_token)
+            
+            if return_token_details:
+                token_str = self.tokenizer.decode([next_token]).replace('\n', '\\n')
+                prob_val = probs[next_token].item()
+                entropy_val = entropy.item()
+                
+                if not is_steered_step:
+                    token_details_list.append({
+                        "token": token_str, "entropy": entropy_val, "prob": prob_val,
+                        "valid": False, "wm_score": 0.0, "reason": "Low Entropy"
+                    })
+                else:
+                    wm_score_val = logit_delta[next_token].item()
+                    token_details_list.append({
+                        "token": token_str, "entropy": entropy_val, "prob": prob_val,
+                        "valid": True, "wm_score": wm_score_val, "reason": ""
+                    })
 
-            # Check for EOS
+            if is_steered_step:
+                natural_top_token = original_logits.argmax().item()
+                if (next_token != natural_top_token) and (logit_delta[next_token].item() > 0):
+                    steered_count += 1        
+            
+            cur_ids = torch.tensor([[next_token]], device=self.device)
             if next_token == self.tokenizer.eos_token_id:
                 break
-
-        return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-
+                
+        total_gen = len(generated_ids) - len(prompt_ids)
+        print(f"\n[DEBUG] Đã sinh {total_gen} tokens | Nhúng Thủy vân thành công: {steered_count}/{total_gen} tokens.")
+        
+        new_tokens = generated_ids[len(prompt_ids):]
+        generated_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        
+        if return_token_details:
+            return generated_text, token_details_list
+        return generated_text
+        
     @torch.no_grad()
-    def generate_unwatermarked(
-        self,
-        prompt: str,
-        max_new_tokens: Optional[int] = None,
-    ) -> str:
-        """
-        Generate text WITHOUT watermark (baseline for comparison).
-        Uses standard model.generate().
-        """
+    def generate_unwatermarked(self, prompt: str, max_new_tokens: Optional[int] = None) -> str:
         max_tokens = max_new_tokens or self.config.model.max_new_tokens
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
         outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=max_tokens,
-            temperature=self.config.model.temperature,
-            top_p=self.config.model.top_p,
-            do_sample=self.config.model.do_sample,
+            **inputs, max_new_tokens=max_tokens, temperature=self.config.model.temperature,
+            top_p=self.config.model.top_p, do_sample=self.config.model.do_sample
         )
-        return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        new_tokens = outputs[0][inputs.input_ids.shape[1]:]
+        return self.tokenizer.decode(new_tokens, skip_special_tokens=True)

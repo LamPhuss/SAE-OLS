@@ -1,0 +1,68 @@
+# ========================
+# Environment & Secrets
+# ========================
+.env
+.env.*
+
+# ========================
+# Large Model Files
+# ========================
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+*.h5
+*.onnx
+models/
+
+# ========================
+# Data Files (large)
+# ========================
+*.csv
+data/
+
+# ========================
+# Text output files
+# ========================
+*.txt
+
+# ========================
+# Python cache
+# ========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ========================
+# Jupyter Notebooks checkpoints
+# ========================
+.ipynb_checkpoints/
+
+# ========================
+# Virtual environments
+# ========================
+venv/
+.venv/
+env/
+.env/
+
+# ========================
+# IDE / Editor
+# ========================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ========================
+# OS files
+# ========================
+.DS_Store
+Thumbs.db

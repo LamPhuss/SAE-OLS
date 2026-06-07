@@ -151,18 +151,3 @@ def get_max_activation_seed(hidden_state: torch.Tensor, secret_key: str) -> int:
     seed_int = int(hashlib.sha256(combo_string.encode('utf-8')).hexdigest()[:8], 16)
     
     return seed_int
-    
-def get_static_prompt_seed(prompt_ids: Sequence[int], secret_key: str) -> int:
-    """
-    Tạo ra một hạt giống (seed) tĩnh duy nhất cho toàn bộ văn bản 
-    dựa trên Secret Key và đoạn Prompt ban đầu.
-    Bất tử trước đòn Paraphrase phần hậu tố.
-    """
-    import hashlib
-    # Nối các ID của prompt thành chuỗi
-    context_str = "_".join(map(str, prompt_ids))
-    combo_string = f"{secret_key}_PROMPT_{context_str}"
-    
-    # Băm lấy 8 ký tự hex đầu tiên
-    seed_int = int(hashlib.sha256(combo_string.encode('utf-8')).hexdigest()[:8], 16)
-    return seed_int

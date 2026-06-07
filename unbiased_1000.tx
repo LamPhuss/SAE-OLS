@@ -1,0 +1,38 @@
+python scripts/evaluate_ub.py
+Loading models for Unbiased Watermark Baseline...
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights: 100%|██████| 288/288 [00:06<00:00, 47.32it/s, Materializing param=model.norm.weight]
+
+--- STEP 1: GENERATION (1000 prompts) ---
+Generating (UB): 100%|█████████████████████████████████████████| 1000/1000 [8:02:05<00:00, 28.93s/it]
+
+--- STEP 2: FIDELITY (PPL & Rep-3) ---
+100%|████████████████████████████████████████████████████████████| 1000/1000 [04:30<00:00,  3.69it/s]
+
+--- STEP 3: DETECTABILITY (EMPIRICAL NORMALIZATION) ---
+100%|████████████████████████████████████████████████████████████| 1000/1000 [54:42<00:00,  3.28s/it]
+Testing Efficiency: 100%|████████████████████████████████████████| 1000/1000 [54:07<00:00,  3.25s/it]
+
+[UB DETECTABILITY METRICS]
+  - UW Z-Score (Null)   : -0.00 (Std: 1.00)
+  - WM Z-Score          : 3.60
+  - Token Efficiency    : ~256.7 tokens
+  - ROC-AUC Score       : 0.9795
+
+[UB FIDELITY OVERVIEW]
+  - Delta PPL: +0.70 | Base PPL: 2.19
+  - Rep-3 (%) : WM = 28.6% | UW = 31.5%
+
+--- STEP 4: ROBUSTNESS (ATTACKS) ---
+Running Attacks (Paraphrase is optimized and protected)...
+Robustness Evals: 100%|████████████████████████████████████████| 1000/1000 [2:32:16<00:00,  9.14s/it]
+
+[4] ROBUSTNESS METRICS (Under Attack)
+  No Attack                 | Z=  3.60 | Drop:   0.0% | Survived(Z>4):  42.4%
+  Deletion (10%)            | Z=  1.46 | Drop:  59.4% | Survived(Z>4):   0.4%
+  Deletion (30%)            | Z=  0.40 | Drop:  89.0% | Survived(Z>4):   0.0%
+  Swap (10%)                | Z=  1.30 | Drop:  64.0% | Survived(Z>4):   0.4%
+  Paraphrase (LLM)          | Z=  0.94 | Drop:  74.0% | Survived(Z>4):   0.4%
+==================================================
+
+Appended UB results to /media/ics-security/Data/PhuPham/watermark/SAE-OLS/scripts/../eval.csv
